@@ -503,10 +503,30 @@ const AccountList: React.FC = () => {
             }
 
             qrPollTimerRef.current = setTimeout(pollStatus, 800);
-          } catch (error) {
+         } catch (error) {
+            // 轮询失败不等于登录失败。
+            //
+            // `/qr-login/check` 在服务端是加锁串行处理的，锁内还会做 Cookie
+            // 增强（起浏览器、刷新 Cookie、拉账号资料）。在 4 核 / 浏览器并发
+            // 上限为 1 的小机器上这一步经常超过 30 秒，前端 axios 默认超时就会
+            // 抛 `timeout of 30000ms exceeded`。
+            //
+            // 原实现在这里直接清 session 并置 error，于是「接口慢了一次」被当成
+            // 「登录失败」上报给用户：账号其实已经保存成功，界面却红字写着
+            // 「账号未登录完成」，用户只能重扫一次，徒增风控。
+            //
+            // 这里改为容忍：保留 session，继续轮询；只有明确拿不到状态才放弃。
+            const errMsg = error instanceof Error ? error.message : '扫码状态查询失败';
+            const isTimeout = /timeout/i.test(errMsg);
+            if (isTimeout) {
+              setQrStatus('processing');
+              setQrMessage('服务器处理中，请稍候…');
+              qrPollTimerRef.current = setTimeout(pollStatus, 3000);
+              return;
+            }
             qrSessionRef.current = '';
             setQrStatus('error');
-            setQrMessage(error instanceof Error ? error.message : '扫码状态查询失败');
+            setQrMessage(errMsg);
           }
         };
 

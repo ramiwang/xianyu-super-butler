@@ -117,7 +117,12 @@ export const generateQRLogin = async (): Promise<{ success: boolean; session_id?
 };
 
 export const checkQRLoginStatus = async (sessionId: string): Promise<any> => {
-  return get(`/qr-login/check/${sessionId}`);
+  // 这个接口在服务端是加锁串行处理的，锁内还会做 Cookie 增强（起浏览器、
+  // 刷新 Cookie、拉账号资料）。在 4 核 / 浏览器并发上限为 1 的小机器上，
+  // 这一步经常超过 axios 默认的 30 秒 —— 前端于是抛 timeout of 30000ms
+  // exceeded，而账号其实已经保存成功，界面却红字显示「账号未登录完成」。
+  // 这里给足 180 秒。
+  return get(`/qr-login/check/${sessionId}`, undefined, { timeout: 180000 });
 };
 
 export const updateAccountStatus = async (id: string, enabled: boolean): Promise<any> => {

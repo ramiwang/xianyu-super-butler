@@ -83,8 +83,22 @@ ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 # 国内构建会卡在这一步直到超时，表现为"镜像构建失败、无法部署"。
 ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 
+# 正式版 Google Chrome 是滑块验证能通过的关键，不是可选项。
+# utils/xianyu_slider_stealth.py 起浏览器时用的是 channel='chrome'，
+# 找不到系统 Chrome 才会回退到 Playwright 自带的 Chromium —— 而那个 Chromium
+# 的指纹会被阿里 nc 直接识破（项目实测：连真人手动拖动都判失败）。
+# 只装 chromium 时容器里根本没有正式版 Chrome，自动滑块等于一直在错的浏览器里硬闯。
+#
+# 注意：playwright install chrome 走的是 apt 源下载 .deb，与上面 Chromium 用的
+# PLAYWRIGHT_DOWNLOAD_HOST 无关，所以这里换不了国内镜像。国内构建时若卡在
+# Google 的 dl.google.com，改用镜像源手动装：
+#   RUN sed -i 's/deb.debian.org/mirrors.ustc.edu.cn/g' /etc/apt/sources.list.d/debian.sources && \
+#       apt-get install -y wget gnupg2 && \
+#       wget -q https://mirrors.ustc.edu.cn/google-chrome/pool/main/g/google-chrome-stable/ \
+#       ...（详见 docs/deployment.md）
 RUN playwright install-deps chromium && \
     playwright install chromium && \
+    playwright install chrome && \
     mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh

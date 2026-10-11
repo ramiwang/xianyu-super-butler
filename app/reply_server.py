@@ -2972,18 +2972,36 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
 
     manager_operation = None
     if cookie_manager.manager:
-        if is_new_account:
-            manager_operation = cookie_manager.manager.add_cookie(
-                account_id,
-                cookies,
-                user_id=user_id,
+        # 挂进 CookieManager 是「启动运行任务」，不是「保存账号」——账号此时
+        # 已经在上面落库了。启动要排队等事件循环，弱机器上（浏览器并发被
+        # browser_limit 压到 1，事件循环里排着别人的浏览器任务）30 秒排不上
+        # 很常见。
+        #
+        # 原实现让这里的 TimeoutError 直接冒到 _process_qr_login_session 的
+        # 失败分支，把整次扫码判成「账号未登录完成」—— 而账号其实已经在
+        # 数据库里了，用户看到红字只会白白重扫一次，还会多担一次风控。
+        # 超时只降级为 warning：账号保存成功，运行任务晚点由刷新循环补上。
+        try:
+            if is_new_account:
+                manager_operation = cookie_manager.manager.add_cookie(
+                    account_id,
+                    cookies,
+                    user_id=user_id,
+                )
+            else:
+                manager_operation = cookie_manager.manager.update_cookie(
+                    account_id,
+                    cookies,
+                    save_to_db=False,
+                )
+        except TimeoutError as op_timeout:
+            log_with_user(
+                'warning',
+                f"账号已保存但启动运行任务超时，稍后将自动补上: "
+                f"账号={account_id}, 异常={op_timeout}",
+                current_user,
             )
-        else:
-            manager_operation = cookie_manager.manager.update_cookie(
-                account_id,
-                cookies,
-                save_to_db=False,
-            )
+            manager_operation = None
 
     log_with_user(
         'info',

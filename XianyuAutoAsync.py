@@ -2364,7 +2364,14 @@ class XianyuLive:
                                         from app.db_manager import db_manager
                                         db_manager.update_risk_control_log(
                                             log_id=log_id,
-                                            processing_result=f"滑块验证失败，耗时: {captcha_duration:.2f}秒, 原因: 未获取到新cookies",
+                                            # 记录真实原因而不是笼统的「未获取到新cookies」。
+                                            # 原来这句话是无条件写死的，浏览器没启动、页面
+                                            # 没有滑块、x5sec 缺失、超时被杀，全都是同一句
+                                            # 话，耗时 0.38 秒的失败也因此完全看不出端倪。
+                                            processing_result=(
+                                                f"滑块验证失败，耗时: {captcha_duration:.2f}秒, "
+                                                f"原因: {getattr(self, 'last_captcha_failure_reason', '') or '未知原因'}"
+                                            ),
                                             processing_status='failed'
                                         )
                                     except Exception as update_e:
@@ -2399,7 +2406,10 @@ class XianyuLive:
                                     from app.db_manager import db_manager
                                     db_manager.update_risk_control_log(
                                         log_id=log_id,
-                                        processing_result=f"滑块验证处理异常，耗时: {captcha_duration:.2f}秒",
+                                            processing_result=(
+                                                f"滑块验证处理异常，耗时: {captcha_duration:.2f}秒, "
+                                                f"错误: {self._safe_str(captcha_e)[:300]}"
+                                            ),
                                         processing_status='failed',
                                         error_message=str(captcha_e)
                                     )
@@ -2578,6 +2588,11 @@ class XianyuLive:
 
     async def _handle_captcha_verification(self, res_json: dict) -> str:
         """处理滑块验证，返回新的cookies字符串"""
+        # 记录本轮失败的**真实**原因。原实现所有失败路径都返回 None，
+        # 调用方只能记一句「未获取到新cookies」—— 但实际上可能是浏览器没启动、
+        # 页面没渲染出滑块、x5sec 缺失、看门狗超时杀进程，处置方式完全不同。
+        # 实测耗时 0.38 秒的失败日志里没有任何线索，就是因为这里不区分。
+        self.last_captcha_failure_reason = ''
         try:
             logger.info(f"【{self.cookie_id}】开始处理滑块验证...")
 
@@ -2592,6 +2607,7 @@ class XianyuLive:
             # 如果没有找到URL，使用默认的验证页面
             if not verification_url:
                 logger.info(f"【{self.cookie_id}】未找到验证URL，认为不需要滑块验证，返回正常")
+                self.last_captcha_failure_reason = 'Token响应中没有验证URL，未启动浏览器'
                 return None
 
             logger.info(f"【{self.cookie_id}】验证URL: {verification_url}")
@@ -2740,6 +2756,17 @@ class XianyuLive:
                 else:
                     logger.error(f"【{self.cookie_id}】滑块验证失败")
 
+                    # 从滑块模块取回失败分类。run() 内部各条失败路径的原因
+                    # 已经写进实例属性，这里只做兜底，避免又落回一句无信息量的
+                    # 「未获取到新cookies」。
+                    detail = getattr(slider_stealth, 'last_failure_reason', '') or '滑块流程返回失败（原因未记录）'
+                    self.last_captcha_failure_reason = detail
+                    logger.error(
+                        f"【{self.cookie_id}】滑块失败真实原因: {detail} "
+                        f"(引擎={getattr(slider_stealth, '_stealth_engine', '未知')}, "
+                        f"headless={slider_headless})"
+                    )
+
                     # 记录滑块验证失败到日志文件
                     log_captcha_event(self.cookie_id, "滑块验证失败", False,
                         f"XianyuSliderStealth执行失败, 环境: {'Docker' if os.getenv('DOCKER_ENV') else '本地'}")
@@ -2765,6 +2792,7 @@ class XianyuLive:
             except ImportError as import_e:
                 logger.error(f"【{self.cookie_id}】XianyuSliderStealth导入失败: {import_e}")
                 logger.error(f"【{self.cookie_id}】请安装Playwright库: pip install playwright")
+                self.last_captcha_failure_reason = f'滑块依赖导入失败: {self._safe_str(import_e)[:200]}'
 
                 # 记录导入失败到日志文件
                 log_captcha_event(self.cookie_id, "XianyuSliderStealth导入失败", False,
@@ -2779,6 +2807,7 @@ class XianyuLive:
 
             except Exception as stealth_e:
                 logger.error(f"【{self.cookie_id}】滑块验证异常: {self._safe_str(stealth_e)}")
+                self.last_captcha_failure_reason = f'滑块执行异常: {self._safe_str(stealth_e)[:300]}'
 
                 # 记录异常到日志文件
                 log_captcha_event(self.cookie_id, "滑块验证异常", False,

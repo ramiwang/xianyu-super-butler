@@ -64,9 +64,16 @@ def find_chromium_executable() -> Optional[str]:
         roots.append(Path.home() / '.cache' / 'ms-playwright')      # Linux
         roots.append(Path.home() / 'Library' / 'Caches' / 'ms-playwright')  # macOS
 
-    # 只认完整版 Chromium：headless shell 缺少滑块页面需要的渲染能力
+    # 只认完整版 Chromium：headless shell 缺少滑块页面需要的渲染能力。
+    #
+    # Linux 目录名在 Playwright 版本间变过：旧版是 chrome-linux/，新版
+    # （实测 chromium-1223）是 chrome-linux64/。原来只写了前者，于是这个函数
+    # 在新镜像上返回 None，回退路径连试都没试就直接抛
+    # 「Executable doesn't exist」—— 系统 Chrome 一起挂掉就没有任何兜底了。
+    # 这里两种都认，并且用 is_dir() 兜住路径变体。
     candidates = (
         'chrome-linux/chrome',
+        'chrome-linux64/chrome',
         'chrome-mac-arm64/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
         'chrome-mac/Google Chrome for Testing.app/Contents/MacOS/Google Chrome for Testing',
         'chrome-win/chrome.exe',
@@ -80,6 +87,11 @@ def find_chromium_executable() -> Optional[str]:
                     executable = browser_dir / suffix
                     if executable.exists():
                         return str(executable)
+                # 目录名再变一层（如 chrome-linux-x64/）也能兜住：只要该目录里
+                # 有一个可执行的 chrome 二进制就用它。
+                for found in browser_dir.rglob('chrome'):
+                    if found.is_file():
+                        return str(found)
         except Exception:
             continue
     return None
@@ -109,6 +121,20 @@ PUNISH_URL_MARKERS = (
     "action=captcha",
     "pureCaptcha",
 )
+
+
+def _reason_str(exc: Any, limit: int = 200) -> str:
+    """把异常压成一行可读文本，用于写进失败原因。
+
+    异常对象里可能夹带二进制内容或换行，直接 str() 出来会撑爆风控日志的
+    processing_result 字段（数据库里是单行文本）。
+    """
+    try:
+        text = str(exc)
+    except Exception:
+        text = repr(exc)
+    text = text.replace('\r', ' ').replace('\n', ' ').strip()
+    return text[:limit]
 
 
 def replay_trajectory(trajectory, start_x, start_y, move, sleep=time.sleep):
@@ -434,6 +460,11 @@ class XianyuSliderStealth:
 
         # 当前验证页地址，重试时需要重新导航以获得全新滑块
         self._current_url = None
+
+        # 本轮滑块流程的真实失败原因，写入后由调用方读走记入风控日志。
+        # 原实现所有失败都只返回 (False, None)，调用方只能记「未获取到新cookies」，
+        # 排查时完全看不出是浏览器没起来、页面没滑块，还是 x5sec 没拿到。
+        self.last_failure_reason = ''
     
     def _check_date_validity(self) -> bool:
         """检查日期有效性 - 已禁用
@@ -534,6 +565,14 @@ class XianyuSliderStealth:
                     f"【{self.pure_user_id}】系统 Chrome 不可用（{chrome_error}），"
                     f"回退 Chromium（引擎: {getattr(self, '_stealth_engine', 'playwright')}）"
                 )
+                # 明确记录：这台机器上自动滑块等于在「会被阿里 nc 识破」的浏览器里跑。
+                # 镜像构建时若漏了 `playwright install chrome`，每轮都会走到这里，
+                # 而原实现只 warning 一句就继续，日志里不留痕迹。
+                self.last_failure_reason = (
+                    '系统 Chrome 不可用，已回退 Playwright Chromium —— '
+                    '该内核指纹会被阿里风控识破，自动滑块通过率极低。'
+                    '请在镜像中执行 `playwright install chrome`'
+                )
                 fallback_options = dict(context_options)
                 # user_agent 为 None 时不要传给 Playwright：传 None 会被当成
                 # 「显式覆盖为空」，反而抹掉 Chromium 的原生 UA。
@@ -556,6 +595,10 @@ class XianyuSliderStealth:
                     logger.warning(
                         f"【{self.pure_user_id}】持久化上下文不可用（{persistent_error}），"
                         "改用普通上下文"
+                    )
+                    self.last_failure_reason = (
+                        '系统 Chrome 与 Chromium 持久化上下文均不可用: '
+                        f'{_reason_str(persistent_error)}'
                     )
                     launch_kwargs: Dict[str, Any] = {
                         'headless': self.headless,
@@ -4316,6 +4359,16 @@ class XianyuSliderStealth:
                 f"【{self.pure_user_id}】滑块流程超过 {timeout:.0f} 秒未结束，"
                 "强制终止以释放浏览器槽位"
             )
+            # 超时和「被判失败」是两种完全不同的问题：前者要查机器负载与浏览器
+            # 槽位，后者要查行为特征。日志里必须能分开，否则两种都只显示成
+            # 一句「滑块验证失败」。
+            try:
+                self.last_failure_reason = (
+                    f'滑块流程超过 {timeout:.0f} 秒未结束（机器过载或浏览器无响应），'
+                    '已被看门狗强制终止'
+                )
+            except Exception:
+                pass
             # 不能在这里调任何 Playwright 同步 API（包括 playwright.stop()）：
             # 同步 API 绑定在创建它的线程上，从定时器线程调用会直接抛
             # 「Cannot switch to a different thread」，等于看门狗白装。
@@ -4356,7 +4409,16 @@ class XianyuSliderStealth:
                 return False, None
 
             # 初始化浏览器
-            self.init_browser()
+            try:
+                self.init_browser()
+            except Exception as init_error:
+                # 浏览器都没起来是最常见的失败（原实现一路冒到最外层只返回
+                # False/None，日志里看不出是启动失败）。这里直接记下真实原因。
+                self.last_failure_reason = f'浏览器启动失败: {_reason_str(init_error)}'
+                logger.error(
+                    f"【{self.pure_user_id}】{self.last_failure_reason}"
+                )
+                return False, None
 
             # 注入账号 Cookie —— 惩罚页的 x5secdata 绑定的是账号会话，
             # 不带 Cookie 时即便滑块拖过，回收到的也只是空浏览器凭证（实测仅 164 字符），
@@ -4398,6 +4460,7 @@ class XianyuSliderStealth:
                 logger.warning(f"【{self.pure_user_id}】页面加载异常，尝试继续: {str(e)}")
                 # 如果页面加载失败，尝试等待一下
                 time.sleep(2)
+                self.last_failure_reason = f'惩罚页加载异常: {_reason_str(e)}'
             
             # 短暂延迟，快速处理
             delay = random.uniform(0.3, 0.8)
@@ -4445,14 +4508,29 @@ class XianyuSliderStealth:
                         logger.warning(f"【{self.pure_user_id}】获取cookie时出错: {str(e)}")
                 else:
                     logger.warning(f"【{self.pure_user_id}】滑块验证失败")
+                    # solve_slider 内部可能已经写了更具体的原因，不覆盖它。
+                    if not self.last_failure_reason:
+                        self.last_failure_reason = (
+                            '滑块拖动完成但服务端判定失败（行为特征识别）'
+                        )
                 
                 return success, cookies
             else:
                 logger.info(f"【{self.pure_user_id}】页面内容不包含验证码相关关键词，可能不需要验证")
+                # 这里返回 (True, None) 是整条链路里最容易让人困惑的一处：
+                # 调用方看到 success=True 却没拿到 cookies，无法判断是「不需要
+                # 验证」还是「页面根本没渲染出滑块」。后者才是真问题 —— x5secdata
+                # 过期时惩罚页会变成一个无滑块的普通页面。
+                self.last_failure_reason = (
+                    '惩罚页未渲染出滑块（x5secdata 可能已过期或页面结构变化），'
+                    f'页面标题={page_title!r}'
+                )
                 return True, None
                 
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】执行过程中出错: {str(e)}")
+            if not self.last_failure_reason:
+                self.last_failure_reason = f'滑块流程异常: {_reason_str(e)}'
             return False, None
         finally:
             watchdog.cancel()

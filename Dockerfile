@@ -63,8 +63,14 @@ COPY --from=builder /app /app
 ENV VIRTUAL_ENV=/opt/venv
 ENV PATH="$VIRTUAL_ENV/bin:$PATH"
 
+# 正式版 Google Chrome 是滑块验证能通过的关键，不是可选项。
+# utils/xianyu_slider_stealth.py 起浏览器时用的是 channel='chrome'，
+# 找不到系统 Chrome 才会回退到 Playwright 自带的 Chromium —— 而那个 Chromium
+# 的指纹会被阿里 nc 直接识破（项目实测：连真人手动拖动都判失败）。
+# 只装 chromium 时容器里根本没有正式版 Chrome，自动滑块等于一直在错的浏览器里硬闯。
 RUN playwright install-deps chromium && \
     playwright install chromium && \
+    playwright install chrome && \
     mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh

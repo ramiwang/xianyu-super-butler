@@ -1,11 +1,21 @@
 from __future__ import annotations
 import asyncio
+import os
 from concurrent.futures import TimeoutError as FuturesTimeoutError
 from typing import Dict, List, Tuple, Optional
 from loguru import logger
 from app.db_manager import db_manager
 
 __all__ = ["CookieManager", "manager"]
+
+
+# 挂进 CookieManager 时等待运行任务启动的上限（秒）。
+#
+# 这个等待只是「等事件循环调度」，真正的重活在协程里异步跑。原值 30 秒在
+# 弱机器上不够：4 核 / 3.6G 的机器上 browser_limit 把浏览器并发压到 1，
+# 事件循环里排着别的账号的浏览器任务，新账号的协程经常 30 秒还排不上，
+# 于是扫码登录被判失败 —— 而账号其实早已落库。
+_TASK_START_TIMEOUT = float(os.getenv('COOKIE_TASK_START_TIMEOUT', '90'))
 
 
 class CookieManager:
@@ -223,9 +233,9 @@ class CookieManager:
             fut = asyncio.run_coroutine_threadsafe(self._add_cookie_async(cookie_id, cookie_value, user_id), self.loop)
             # 同 remove_cookie：这里也要抢账号任务锁，不设超时会让请求永久挂起
             try:
-                return fut.result(timeout=30)
+                return fut.result(timeout=_TASK_START_TIMEOUT)
             except FuturesTimeoutError:
-                logger.error(f"【{cookie_id}】添加账号超时（30秒）")
+                logger.error(f"【{cookie_id}】添加账号超时（{_TASK_START_TIMEOUT}秒）")
                 raise TimeoutError(f"添加账号超时，请稍后重试：{cookie_id}")
 
     def remove_cookie(self, cookie_id: str):
@@ -395,9 +405,9 @@ class CookieManager:
             fut = asyncio.run_coroutine_threadsafe(_update(), self.loop)
             # 更新 Cookie 会重启账号任务，同样需要超时兜底
             try:
-                return fut.result(timeout=30)
+                return fut.result(timeout=_TASK_START_TIMEOUT)
             except FuturesTimeoutError:
-                logger.error(f"【{cookie_id}】更新账号Cookie超时（30秒）")
+                logger.error(f"【{cookie_id}】更新账号Cookie超时（{_TASK_START_TIMEOUT}秒）")
                 raise TimeoutError(f"更新账号超时，请稍后重试：{cookie_id}")
 
     def update_keywords(self, cookie_id: str, kw_list: List[Tuple[str, str]]):
