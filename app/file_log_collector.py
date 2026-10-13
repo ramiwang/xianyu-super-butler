@@ -14,7 +14,7 @@ from typing import List, Dict
 class FileLogCollector:
     """基于文件监控的日志收集器"""
     
-    def __init__(self, max_logs: int = 2000):
+    def __init__(self, max_logs: int = 20000):
         self.max_logs = max_logs
         self.logs = deque(maxlen=max_logs)
         self.lock = threading.Lock()
@@ -62,9 +62,12 @@ class FileLogCollector:
             logger.add(
                 self.log_file,
                 format="{time:YYYY-MM-DD HH:mm:ss.SSS} | {level} | {name}:{function}:{line} - {message}",
-                level="INFO",  # 从DEBUG改为INFO，减少日志量
-                rotation="10 MB",
-                retention="3 days",  # 从7天改为3天，减少磁盘占用
+                level=os.getenv('FILE_LOG_LEVEL', 'INFO'),
+                # 轮转后只留 3 天时，登录态断开这类偶发问题往往正好被压掉，
+                # 事后只能看到结果、看不到过程。默认保留 14 天，磁盘紧张时
+                # 可通过环境变量 FILE_LOG_RETENTION 调小。
+                rotation=os.getenv('FILE_LOG_ROTATION', '50 MB'),
+                retention=os.getenv('FILE_LOG_RETENTION', '14 days'),
                 enqueue=False,  # 改为False，避免队列延迟
                 buffering=1     # 行缓冲，立即写入
             )

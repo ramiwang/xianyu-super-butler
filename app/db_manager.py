@@ -7892,6 +7892,33 @@ class DBManager:
             logger.error(f"更新风控日志失败: {e}")
             return False
 
+    def add_diagnostic_event(self, cookie_id: str, event_type: str,
+                             event_description: str, processing_result: str = None,
+                             processing_status: str = 'failed',
+                             error_message: str = None) -> Optional[int]:
+        """写入一条诊断事件并返回记录 ID。
+
+        滑块/风控以外的故障（浏览器槽位超时、扫码增强失败、Token 刷新失败、
+        重连失败）过去只写文本日志，界面上看不到，历史一压就没法追溯。
+        这里复用同一张表，让这些故障在「风控日志」页面可查，同时返回 ID
+        便于调用方后续更新处理结果。
+        """
+        try:
+            with self.lock:
+                cursor = self.conn.cursor()
+                cursor.execute('''
+                    INSERT INTO risk_control_logs
+                    (cookie_id, event_type, event_description, processing_result,
+                     processing_status, error_message)
+                    VALUES (?, ?, ?, ?, ?, ?)
+                ''', (cookie_id, event_type, event_description, processing_result,
+                      processing_status, error_message))
+                self.conn.commit()
+                return cursor.lastrowid
+        except Exception as e:
+            logger.error(f"写入诊断事件失败: {e}")
+            return None
+
     def get_risk_control_logs(
         self,
         cookie_id: str = None,
@@ -8049,11 +8076,12 @@ class DBManager:
                     logger.warning(f"清理AI对话历史失败: {e}")
                     stats['ai_conversations'] = 0
                 
-                # 清理风控日志（保留最近90天）
+                # 清理风控日志（保留最近180天）。诊断类事件（浏览器槽位超时、
+                # 扫码增强失败、重连失败）往往隔很久才需要复盘，90 天太短。
                 try:
                     cursor.execute(
                         "DELETE FROM risk_control_logs WHERE created_at < datetime('now', '-' || ? || ' days')",
-                        (days,)
+                        (max(days, 180),)
                     )
                     stats['risk_control_logs'] = cursor.rowcount
                     if cursor.rowcount > 0:

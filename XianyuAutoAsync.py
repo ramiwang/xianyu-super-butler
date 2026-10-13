@@ -8307,6 +8307,21 @@ class XianyuLive:
                 f"type={type(e).__name__}, elapsed={time.perf_counter() - started_at:.2f}s, "
                 f"detail={self._safe_str(e)}"
             )
+            try:
+                from app.db_manager import db_manager
+                db_manager.add_diagnostic_event(
+                    cookie_id=target_cookie_id,
+                    event_type='qr_enhance_failed',
+                    event_description='扫码Cookie后台增强失败',
+                    processing_result=(
+                        f"type={type(e).__name__}, "
+                        f"elapsed={time.perf_counter() - started_at:.2f}s"
+                    ),
+                    processing_status='failed',
+                    error_message=self._safe_str(e)[:500],
+                )
+            except Exception as diag_e:
+                logger.warning(f"【{target_cookie_id}】写入诊断事件失败: {type(diag_e).__name__}")
             return False
         finally:
             # 确保资源清理

@@ -2995,6 +2995,17 @@ async def process_qr_login_cookies(cookies: str, unb: str, current_user: Dict[st
                     save_to_db=False,
                 )
         except TimeoutError as op_timeout:
+            try:
+                db_manager.add_diagnostic_event(
+                    cookie_id=account_id,
+                    event_type='task_start_timeout',
+                    event_description='扫码Cookie已落库，但账号运行任务启动/更新超时',
+                    processing_result='账号已保存，运行任务未在超时时间内完成',
+                    processing_status='failed',
+                    error_message=str(op_timeout),
+                )
+            except Exception as diag_e:
+                log_with_user('warning', f"写入诊断事件失败: {diag_e}", current_user)
             log_with_user(
                 'warning',
                 f"账号已保存但启动运行任务超时，稍后将自动补上: "
@@ -3142,6 +3153,25 @@ async def _enhance_qr_login_cookies(
         f"耗时={time.perf_counter() - started_at:.2f}s",
         current_user,
     )
+    if not refresh_success:
+        profile_desc = (
+            '成功' if profile_success
+            else f"失败({profile_error_type or 'unknown'})"
+        )
+        db_manager.add_diagnostic_event(
+            cookie_id=account_id,
+            event_type='qr_enhance_failed',
+            event_description='扫码Cookie已保存，但后台补全真实Cookie失败',
+            processing_result=(
+                f"cookie_refresh=失败({refresh_error_type or 'unknown'}), "
+                f"profile={profile_desc}, "
+                f"耗时={time.perf_counter() - started_at:.2f}s"
+            ),
+            processing_status='failed',
+            error_message=(
+                "扫码后台增强未能完成。Cookie 已落库，账号运行态可能仍需等待或人工刷新。"
+            ),
+        )
 
 
 @app.post("/qr-login/refresh-cookies")
