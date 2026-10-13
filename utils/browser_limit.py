@@ -14,6 +14,7 @@ CPU 上，两三个并存就足以把整机拖到 99%，启动变慢又导致任
 import asyncio
 import os
 import threading
+import time
 from contextlib import contextmanager
 from typing import Any, Dict, Optional
 
@@ -28,11 +29,49 @@ _ENV_KEY = 'MAX_CONCURRENT_BROWSERS'
 _semaphore: Optional[threading.Semaphore] = None
 _semaphore_lock = threading.Lock()
 _limit: Optional[int] = None
+_active_lock = threading.Lock()
+_active_jobs: Dict[int, Dict[str, Any]] = {}
+_next_job_id = 0
 
 # 等待空闲浏览器的上限。低配机器上一次浏览器任务可能要一两分钟，
 # 排队本身是正常的；但等过这个时间基本说明有任务卡死了，
 # 与其无限期挂着，不如报错让上层记录并重试。
 _ACQUIRE_TIMEOUT = 300
+
+
+def _process_snapshot() -> str:
+    """返回 Chromium/Playwright 进程摘要，避免日志里只能看到槽位超时。"""
+    try:
+        import psutil
+        names = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            info = proc.info
+            text = ' '.join(info.get('cmdline') or [])
+            name = info.get('name') or ''
+            if any(key in f'{name} {text}'.lower() for key in ('chrome', 'chromium', 'playwright')):
+                names.append(f"{info.get('pid')}:{name}")
+        return f"count={len(names)} pids={','.join(names[:20]) or '-'}"
+    except Exception as exc:
+        return f"unavailable={type(exc).__name__}"
+
+
+def _register_job(purpose: str) -> int:
+    global _next_job_id
+    with _active_lock:
+        _next_job_id += 1
+        job_id = _next_job_id
+        _active_jobs[job_id] = {'purpose': purpose, 'started_at': time.monotonic()}
+        logger.info(f"浏览器槽位获取成功: job={job_id}, purpose={purpose}, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
+        return job_id
+
+
+def _unregister_job(job_id: Optional[int], purpose: str, reason: str) -> None:
+    if job_id is None:
+        return
+    with _active_lock:
+        item = _active_jobs.pop(job_id, None)
+        elapsed = time.monotonic() - item['started_at'] if item else 0
+        logger.info(f"浏览器槽位释放: job={job_id}, purpose={purpose}, reason={reason}, elapsed={elapsed:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
 
 
 def _detect_total_memory_gb() -> Optional[float]:
@@ -100,10 +139,11 @@ class LimitedBrowser:
     其余属性一律透传，用起来与原对象无差别。
     """
 
-    def __init__(self, browser: Any, semaphore: threading.Semaphore, purpose: str):
+    def __init__(self, browser: Any, semaphore: threading.Semaphore, purpose: str, job_id: int):
         self._browser = browser
         self._semaphore = semaphore
         self._purpose = purpose
+        self._job_id = job_id
         self._released = False
         self._release_lock = threading.Lock()
 
@@ -112,6 +152,7 @@ class LimitedBrowser:
             if not self._released:
                 self._released = True
                 self._semaphore.release()
+                _unregister_job(self._job_id, self._purpose, 'browser.close')
 
     async def close(self, *args, **kwargs):
         try:
@@ -135,21 +176,27 @@ async def launch_browser(
     semaphore = _get_semaphore()
 
     # 在线程里等待，避免占着事件循环不放导致消息收发一起卡住
+    started = time.monotonic()
+    logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     acquired = await asyncio.to_thread(semaphore.acquire, True, _ACQUIRE_TIMEOUT)
     if not acquired:
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
         )
 
     try:
+        job_id = _register_job(purpose)
         browser = await playwright.chromium.launch(**(launch_options or {}))
     except BaseException:
         # 启动失败要立刻归还，否则槽位会被永久占住
         semaphore.release()
+        _unregister_job(locals().get('job_id'), purpose, 'launch_failed')
         raise
 
-    return LimitedBrowser(browser, semaphore, purpose)
+    logger.info(f"浏览器启动完成: job={job_id}, purpose={purpose}, {_process_snapshot()}")
+    return LimitedBrowser(browser, semaphore, purpose, job_id)
 
 
 @contextmanager
@@ -163,16 +210,21 @@ def browser_slot(purpose: str = '浏览器任务'):
             ...
     """
     semaphore = _get_semaphore()
+    started = time.monotonic()
+    logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     acquired = semaphore.acquire(True, _ACQUIRE_TIMEOUT)
     if not acquired:
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
         )
     try:
+        job_id = _register_job(purpose)
         yield
     finally:
         semaphore.release()
+        _unregister_job(locals().get('job_id'), purpose, 'context_exit')
 
 
 def acquire_slot(purpose: str = '浏览器任务') -> None:
@@ -181,7 +233,10 @@ def acquire_slot(purpose: str = '浏览器任务') -> None:
     取到之后必须调用 release_slot 归还，否则后续任务会一直排队。
     """
     semaphore = _get_semaphore()
+    started = time.monotonic()
+    logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     if not semaphore.acquire(True, _ACQUIRE_TIMEOUT):
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
@@ -192,6 +247,9 @@ def release_slot(purpose: str = '浏览器任务') -> None:
     """归还 acquire_slot 取得的槽位。重复调用会被忽略调用方自行保证配对。"""
     try:
         _get_semaphore().release()
+        with _active_lock:
+            job_id = next((key for key, item in _active_jobs.items() if item['purpose'] == purpose), None)
+        _unregister_job(job_id, purpose, 'explicit_release')
     except ValueError:
         # 归还次数多于取用次数，说明配对有误；记录但不影响主流程
         logger.warning(f"{purpose}: 浏览器槽位重复归还，已忽略")

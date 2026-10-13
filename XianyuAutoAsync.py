@@ -235,6 +235,16 @@ class XianyuLive:
             else:
                 logger.info(state_msg)
 
+            logger.info(
+                f"【{self.cookie_id}】连接诊断: state={new_state.value}, "
+                f"reason={reason or '-'}, last_heartbeat="
+                f"{self.last_heartbeat_time or 0:.3f}, "
+                f"last_heartbeat_response={self.last_heartbeat_response or 0:.3f}, "
+                f"last_token_refresh={self.last_token_refresh_time or 0:.3f}, "
+                f"token_status={getattr(self, 'last_token_refresh_status', '-')}, "
+                f"needs_relogin={getattr(self, 'needs_relogin', False)}"
+            )
+
     async def _interruptible_sleep(self, duration: float):
         """可中断的sleep，将长时间sleep拆分成多个短时间sleep，以便及时响应取消信号
         
@@ -7962,7 +7972,9 @@ class XianyuLive:
         browser = None
         target_cookie_id = cookie_id or self.cookie_id
         target_user_id = user_id or self.user_id
+        enhancement_success = False
 
+        started_at = time.perf_counter()
         try:
             import asyncio
             from playwright.async_api import async_playwright
@@ -7973,6 +7985,10 @@ class XianyuLive:
 
             # 解析扫码登录的cookie
             qr_cookies_dict = trans_cookies(qr_cookies_str)
+            logger.info(
+                f"【{target_cookie_id}】扫码Cookie后台增强开始: "
+                f"cookie_fields={len(qr_cookies_dict)}, cookie_len={len(qr_cookies_str)}"
+            )
             logger.info(
                 f"【{target_cookie_id}】扫码cookie字段数: {len(qr_cookies_dict)}, "
                 f"字段: {sorted(qr_cookies_dict.keys())}"
@@ -8119,6 +8135,7 @@ class XianyuLive:
                 )
 
             logger.info(f"【{target_cookie_id}】正在启动无头浏览器")
+            logger.info(f"【{target_cookie_id}】扫码增强准备获取浏览器槽位")
             browser = await browser_limit.launch_browser(playwright, launch_options, "扫码登录")
             logger.info(f"【{target_cookie_id}】无头浏览器启动成功")
 
@@ -8267,6 +8284,7 @@ class XianyuLive:
 
             if success:
                 logger.info(f"【{target_cookie_id}】真实Cookie已成功保存到数据库")
+                enhancement_success = True
 
                 # 如果当前实例的cookie_id匹配，更新实例的cookie信息
                 if target_cookie_id == self.cookie_id:
@@ -8284,7 +8302,11 @@ class XianyuLive:
                 return False
 
         except Exception as e:
-            logger.error(f"【{target_cookie_id}】使用扫码cookie获取真实cookie失败: {self._safe_str(e)}")
+            logger.error(
+                f"【{target_cookie_id}】使用扫码cookie获取真实cookie失败: "
+                f"type={type(e).__name__}, elapsed={time.perf_counter() - started_at:.2f}s, "
+                f"detail={self._safe_str(e)}"
+            )
             return False
         finally:
             # 确保资源清理
@@ -8325,6 +8347,11 @@ class XianyuLive:
                         logger.warning(f"【{target_cookie_id}】关闭Playwright时出错: {self._safe_str(e)}")
             except Exception as cleanup_e:
                 logger.warning(f"【{target_cookie_id}】清理浏览器资源时出错: {self._safe_str(cleanup_e)}")
+            logger.info(
+                f"【{target_cookie_id}】扫码Cookie后台增强结束: "
+                f"success={enhancement_success}, "
+                f"elapsed={time.perf_counter() - started_at:.2f}s"
+            )
 
     async def _refresh_cookies_via_browser_page(self, current_cookies_str: str):
         """使用当前cookie访问指定页面获取真实cookie并更新
@@ -10495,6 +10522,7 @@ class XianyuLive:
                             logger.info(f"【{self.cookie_id}】准备进入消息循环...")
 
                             async for message in websocket:
+                                self.last_message_time = time.time()
                                 logger.info(f"【{self.cookie_id}】收到WebSocket消息: {len(message) if message else 0} 字节")
                                 try:
                                     message_data = json.loads(message)
@@ -10522,7 +10550,13 @@ class XianyuLive:
                             if self.ws == websocket:
                                 self.ws = None
                                 self._fail_pending_im_requests("闲鱼消息连接已断开")
-                                logger.info(f"【{self.cookie_id}】WebSocket连接已退出，引用已清理")
+                                logger.info(
+                                    f"【{self.cookie_id}】WebSocket连接已退出，引用已清理: "
+                                    f"closed={getattr(websocket, 'closed', None)}, "
+                                    f"close_code={getattr(websocket, 'close_code', None)}, "
+                                    f"close_reason={getattr(websocket, 'close_reason', None)}, "
+                                    f"last_message_age={time.time() - getattr(self, 'last_message_time', time.time()):.1f}s"
+                                )
 
                 except Exception as e:
                     error_msg = self._safe_str(e)
@@ -10538,9 +10572,16 @@ class XianyuLive:
                     )
                     
                     # 对于连接关闭错误，使用警告级别而不是错误级别
+                    close_code = getattr(getattr(self, 'ws', None), 'close_code', None)
+                    close_reason = getattr(getattr(self, 'ws', None), 'close_reason', None)
                     if is_connection_closed:
                         logger.warning(f"【{self.cookie_id}】WebSocket连接已关闭 ({self.connection_failures + 1}/{self.max_connection_failures})")
-                        logger.warning(f"【{self.cookie_id}】关闭原因: {error_msg}")
+                        logger.warning(
+                            f"【{self.cookie_id}】关闭原因: {error_msg}; "
+                            f"close_code={close_code}, close_reason={close_reason}, "
+                            f"last_heartbeat_age={time.time() - getattr(self, 'last_heartbeat_time', time.time()):.1f}s, "
+                            f"last_response_age={time.time() - getattr(self, 'last_heartbeat_response', time.time()):.1f}s"
+                        )
                     else:
                         self.connection_failures += 1
                     # 更新连接状态为重连中

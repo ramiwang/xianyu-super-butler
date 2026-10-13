@@ -407,7 +407,20 @@ class CookieManager:
             try:
                 return fut.result(timeout=_TASK_START_TIMEOUT)
             except FuturesTimeoutError:
-                logger.error(f"【{cookie_id}】更新账号Cookie超时（{_TASK_START_TIMEOUT}秒）")
+                task = self.tasks.get(cookie_id)
+                task_state = (
+                    f"task_done={task.done()} task_cancelled={task.cancelled()}"
+                    if task is not None else "task=missing"
+                )
+                active = ','.join(
+                    f"{cid}:{'done' if item.done() else 'running'}"
+                    for cid, item in self.tasks.items()
+                ) or '-'
+                logger.error(
+                    f"【{cookie_id}】更新账号Cookie超时（{_TASK_START_TIMEOUT}秒）; "
+                    f"{task_state}; tasks={active}; "
+                    f"instances={','.join(self.instances.keys()) or '-'}"
+                )
                 raise TimeoutError(f"更新账号超时，请稍后重试：{cookie_id}")
 
     def update_keywords(self, cookie_id: str, kw_list: List[Tuple[str, str]]):
