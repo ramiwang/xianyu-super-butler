@@ -454,9 +454,22 @@ const AccountList: React.FC = () => {
 
             if (statusRes.status === 'success') {
               qrSessionRef.current = '';
+              // 服务端带回了 30 分钟内的扫码次数。重扫是登录不上时最常见的
+              // 动作，也正是最容易把风控喂大的动作，所以直接把次数和劝阻
+              // 摆在成功提示里，而不是等用户自己发现。
+              if (statusRes.qr_rescan_count > 1) {
+                setQrMessage(
+                  `${statusRes.message || '账号 Cookie 已刷新并保存'}（30 分钟内第 ${statusRes.qr_rescan_count} 次扫码）`,
+                );
+              }
               if (statusRes.account_ready) {
                 setQrStatus('success');
-                setQrMessage(statusRes.message || '账号 Cookie 已刷新并保存');
+                if (!statusRes.qr_rescan_count || statusRes.qr_rescan_count <= 1) {
+                  setQrMessage(statusRes.message || '账号 Cookie 已刷新并保存');
+                }
+                if (statusRes.qr_rescan_notice) {
+                  notify(statusRes.qr_rescan_notice, 'warning');
+                }
                 setTimeout(() => {
                   setShowQRModal(false);
                   loadAccounts();

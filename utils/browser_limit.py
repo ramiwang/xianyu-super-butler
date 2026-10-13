@@ -33,6 +33,9 @@ _active_lock = threading.Lock()
 _active_jobs: Dict[int, Dict[str, Any]] = {}
 _next_job_id = 0
 
+# 槽位归还后仍记下这次的进程号：浏览器关不掉时，正是靠这份记录去收尸。
+_recent_jobs: Dict[str, Dict[str, Any]] = {}
+
 # 等待空闲浏览器的上限。低配机器上一次浏览器任务可能要一两分钟，
 # 排队本身是正常的；但等过这个时间基本说明有任务卡死了，
 # 与其无限期挂着，不如报错让上层记录并重试。
@@ -65,14 +68,178 @@ def _register_job(purpose: str) -> int:
         return job_id
 
 
+def _bind_job_pids(job_id: Optional[int]) -> None:
+    """把当前 Chromium 进程登记到这个槽位名下。
+
+    只有登记过的进程才算有主的活进程；关不掉的残留会以孤儿身份被清理。否则
+    「关不掉」和「正在用」在进程列表里长得一模一样，没法区分。
+    """
+    if job_id is None:
+        return
+    pids = _chromium_pids()
+    with _active_lock:
+        item = _active_jobs.get(job_id)
+        if item is not None:
+            item['pids'] = pids
+
+
+def bind_current_pids(purpose: str) -> None:
+    """按用途登记当前进程（滑块验证这类自行启动浏览器的场景用）。"""
+    with _active_lock:
+        job_id = next(
+            (key for key, item in _active_jobs.items() if item['purpose'] == purpose),
+            None,
+        )
+    _bind_job_pids(job_id)
+
+
+def _chromium_pids() -> set:
+    """当前可见的 Chromium/Playwright 进程 PID 集合。"""
+    try:
+        import psutil
+        pids = set()
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline']):
+            info = proc.info
+            name = info.get('name') or ''
+            text = ' '.join(info.get('cmdline') or [])
+            if any(key in f'{name} {text}'.lower() for key in ('chrome', 'chromium', 'playwright')):
+                pids.add(info.get('pid'))
+        return pids
+    except Exception:
+        return set()
+
+
+def describe_active_jobs() -> str:
+    """在册槽位摘要，用于超时日志指出到底是谁占着不放。"""
+    with _active_lock:
+        if not _active_jobs:
+            return '无在册浏览器任务'
+        return '; '.join(
+            f"job={job_id} purpose={item['purpose']} "
+            f"已运行={time.monotonic() - item['started_at']:.0f}s"
+            for job_id, item in sorted(_active_jobs.items())
+        )
+
+
+def reap_orphan_browsers(min_age_seconds: int = 60) -> int:
+    """清掉不属于任何在册槽位、且已存活够久的 Chromium 进程。
+
+    Playwright 的浏览器关不掉时进程会一直留在容器里：启动前就有残留、槽位被
+    占满、滑块验证越来越慢，而日志里只能看到 count 一直涨。这里按「有没有
+    主人」判定——在册槽位的进程不动，其余超过 min_age_seconds 的直接终止。
+    """
+    try:
+        import psutil
+    except Exception as exc:
+        logger.warning(f"清理残留浏览器失败: psutil 不可用 ({type(exc).__name__})")
+        return 0
+
+    try:
+        with _active_lock:
+            protected = set()
+            for item in _active_jobs.values():
+                protected |= set(item.get('pids') or set())
+
+        now = time.time()
+        killed = []
+        for proc in psutil.process_iter(['pid', 'name', 'cmdline', 'create_time']):
+            info = proc.info
+            pid = info.get('pid')
+            if pid in protected or pid == os.getpid():
+                continue
+            name = info.get('name') or ''
+            text = ' '.join(info.get('cmdline') or [])
+            if not any(key in f'{name} {text}'.lower() for key in ('chrome', 'chromium', 'playwright')):
+                continue
+            try:
+                created_at = info.get('create_time')
+                if created_at is not None and now - created_at < min_age_seconds:
+                    continue
+                proc.kill()
+                killed.append(f'{pid}:{name}')
+            except Exception as exc:
+                logger.debug(f"清理进程 {pid} 失败: {type(exc).__name__}")
+
+        if killed:
+            logger.warning(
+                f"清理残留浏览器进程: killed={len(killed)}, "
+                f"protected={len(protected)}, pids={','.join(killed[:20])}"
+            )
+        else:
+            logger.info(f"检查残留浏览器进程: 无需清理, protected={len(protected)}")
+        return len(killed)
+    except Exception as exc:
+        logger.warning(f"清理残留浏览器失败: {type(exc).__name__}: {exc}")
+        return 0
+
+
+_reaper_started = False
+
+
+def _start_reaper(interval_seconds: int = 300) -> None:
+    """后台定期回收残留浏览器进程，随进程内信号量一起懒启动。"""
+    global _reaper_started
+    with _active_lock:
+        if _reaper_started:
+            return
+        _reaper_started = True
+
+    def _loop() -> None:
+        while True:
+            time.sleep(interval_seconds)
+            try:
+                reap_orphan_browsers()
+            except Exception as exc:
+                logger.warning(f"残留浏览器清理线程异常: {type(exc).__name__}: {exc}")
+
+    threading.Thread(target=_loop, name='browser-reaper', daemon=True).start()
+    logger.info(f"残留浏览器清理线程已启动: interval={interval_seconds}s")
+
+
 def _unregister_job(job_id: Optional[int], purpose: str, reason: str) -> None:
     if job_id is None:
         return
     with _active_lock:
         item = _active_jobs.pop(job_id, None)
         elapsed = time.monotonic() - item['started_at'] if item else 0
-        logger.info(f"浏览器槽位释放: job={job_id}, purpose={purpose}, reason={reason}, elapsed={elapsed:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
+        if item and item.get('pids'):
+            _recent_jobs[purpose] = {
+                'pids': set(item['pids']),
+                'finished_at': time.monotonic(),
+            }
+    logger.info(f"浏览器槽位释放: job={job_id}, purpose={purpose}, reason={reason}, elapsed={elapsed:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
 
+
+def kill_recent_pids(purpose: str, max_age_seconds: int = 300) -> int:
+    """终止某用途最近一次浏览器任务遗留的进程，返回终止数量。
+
+    Playwright 关闭超时时，close() 没生效但槽位已经归还，进程就这么留在容器里。
+    这里按记录的 PID 精确清理，不动别人的浏览器。
+    """
+    try:
+        import psutil
+    except Exception:
+        return 0
+
+    with _active_lock:
+        record = _recent_jobs.get(purpose)
+    if not record:
+        return 0
+    if time.monotonic() - record['finished_at'] > max_age_seconds:
+        return 0
+
+    killed = 0
+    for pid in sorted(record['pids']):
+        try:
+            proc = psutil.Process(pid)
+            if proc.is_running() and proc.status() != psutil.STATUS_ZOMBIE:
+                proc.kill()
+                killed += 1
+        except Exception:
+            continue
+    with _active_lock:
+        _recent_jobs.pop(purpose, None)
+    return killed
 
 def _detect_total_memory_gb() -> Optional[float]:
     """物理内存（GB）。取不到时返回 None，由调用方只按 CPU 判断。"""
@@ -128,6 +295,7 @@ def _get_semaphore() -> threading.Semaphore:
         with _semaphore_lock:
             if _semaphore is None:
                 _semaphore = threading.Semaphore(get_limit())
+    _start_reaper()
     return _semaphore
 
 
@@ -180,7 +348,7 @@ async def launch_browser(
     logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     acquired = await asyncio.to_thread(semaphore.acquire, True, _ACQUIRE_TIMEOUT)
     if not acquired:
-        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, 占用者=[{describe_active_jobs()}], {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
@@ -189,6 +357,7 @@ async def launch_browser(
     try:
         job_id = _register_job(purpose)
         browser = await playwright.chromium.launch(**(launch_options or {}))
+        _bind_job_pids(job_id)
     except BaseException:
         # 启动失败要立刻归还，否则槽位会被永久占住
         semaphore.release()
@@ -214,7 +383,7 @@ def browser_slot(purpose: str = '浏览器任务'):
     logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     acquired = semaphore.acquire(True, _ACQUIRE_TIMEOUT)
     if not acquired:
-        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, 占用者=[{describe_active_jobs()}], {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"
@@ -236,7 +405,7 @@ def acquire_slot(purpose: str = '浏览器任务') -> None:
     started = time.monotonic()
     logger.info(f"等待浏览器槽位: purpose={purpose}, limit={get_limit()}, {_process_snapshot()}")
     if not semaphore.acquire(True, _ACQUIRE_TIMEOUT):
-        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, {_process_snapshot()}")
+        logger.error(f"浏览器槽位等待超时: purpose={purpose}, waited={time.monotonic() - started:.1f}s, active={len(_active_jobs)}/{get_limit()}, 占用者=[{describe_active_jobs()}], {_process_snapshot()}")
         raise TimeoutError(
             f"{purpose}: 等待浏览器空闲超过 {_ACQUIRE_TIMEOUT} 秒。"
             "可能有浏览器任务卡住未退出，或机器性能不足以支撑当前账号数量。"

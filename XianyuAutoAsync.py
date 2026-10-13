@@ -7973,6 +7973,10 @@ class XianyuLive:
         target_cookie_id = cookie_id or self.cookie_id
         target_user_id = user_id or self.user_id
         enhancement_success = False
+        # 失败原因写回实例，供上层（reply_server）写进风控日志。
+        # 「扫码后登不上」在界面上只有一个红字，落到风控日志里必须能分辨是
+        # Playwright 起不来、浏览器缺失、页面访问失败，还是 Cookie 没补全。
+        self.qr_enhance_failure_reason = None
 
         started_at = time.perf_counter()
         try:
@@ -8037,6 +8041,7 @@ class XianyuLive:
                     logger.warning(f"【{target_cookie_id}】Docker环境下Playwright启动成功")
                 except asyncio.TimeoutError:
                     logger.error(f"【{target_cookie_id}】Docker环境下Playwright启动超时")
+                    self.qr_enhance_failure_reason = 'playwright_start_timeout'
                     return False
                 finally:
                     # 恢复原策略
@@ -8050,6 +8055,7 @@ class XianyuLive:
                     )
                 except asyncio.TimeoutError:
                     logger.error(f"【{target_cookie_id}】Playwright启动超时")
+                    self.qr_enhance_failure_reason = 'playwright_start_timeout'
                     return False
 
             # 启动浏览器（参照商品搜索的配置）
@@ -8125,6 +8131,7 @@ class XianyuLive:
                         f"Playwright预期路径不存在: {bundled_executable}；"
                         "系统Chrome/Edge也未找到。请执行: python -m playwright install chromium"
                     )
+                    self.qr_enhance_failure_reason = 'browser_not_found'
                     return False
 
                 browser_name, browser_path = system_browser
@@ -8299,9 +8306,11 @@ class XianyuLive:
                 return True
             else:
                 logger.error(f"【{target_cookie_id}】保存真实Cookie到数据库失败")
+                self.qr_enhance_failure_reason = 'cookie_save_failed'
                 return False
 
         except Exception as e:
+            self.qr_enhance_failure_reason = f'exception:{type(e).__name__}'
             logger.error(
                 f"【{target_cookie_id}】使用扫码cookie获取真实cookie失败: "
                 f"type={type(e).__name__}, elapsed={time.perf_counter() - started_at:.2f}s, "
@@ -8346,11 +8355,13 @@ class XianyuLive:
                 if playwright:
                     try:
                         logger.warning(f"【{target_cookie_id}】正在关闭Playwright...")
-                        await asyncio.wait_for(playwright.stop(), timeout=2.0)
+                        await asyncio.wait_for(playwright.stop(), timeout=10.0)
                         logger.warning(f"【{target_cookie_id}】Playwright关闭完成")
                     except asyncio.TimeoutError:
-                        logger.warning(f"【{target_cookie_id}】Playwright关闭超时（2秒），进程可能仍在运行")
-                        logger.warning(f"【{target_cookie_id}】提示：如果后续Playwright启动失败，可能需要手动清理残留进程")
+                        logger.warning(
+                            f"【{target_cookie_id}】Playwright关闭超时（10秒），"
+                            "转而清理本次启动的浏览器进程"
+                        )
                         # 尝试清理Playwright的内部状态
                         try:
                             # 取消可能正在运行的Playwright任务
@@ -8358,6 +8369,20 @@ class XianyuLive:
                                 playwright._transport = None
                         except:
                             pass
+                        # 超时意味着浏览器进程八成还活着。槽位已经归还，若不按进程
+                        # 收尸，这些 Chromium 会一直留在容器里累积（腾讯云看到大量
+                        # 浏览器进程、以及后来「等待浏览器空闲超过 300 秒」都是这么来的）。
+                        try:
+                            from utils.browser_limit import kill_recent_pids
+                            killed = kill_recent_pids('扫码登录')
+                            logger.warning(
+                                f"【{target_cookie_id}】残留浏览器进程清理: killed={killed}"
+                            )
+                        except Exception as kill_e:
+                            logger.warning(
+                                f"【{target_cookie_id}】清理残留浏览器进程失败: "
+                                f"{type(kill_e).__name__}: {self._safe_str(kill_e)}"
+                            )
                     except Exception as e:
                         logger.warning(f"【{target_cookie_id}】关闭Playwright时出错: {self._safe_str(e)}")
             except Exception as cleanup_e:

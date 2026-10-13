@@ -39,6 +39,7 @@ from app.routers.delivery_block import create_delivery_block_router
 from app.routers.logistics_quote import create_logistics_quote_router
 from app.routers.logistics_agent import create_logistics_agent_router
 from utils.qr_login import qr_login_manager
+from utils import qr_rescan
 from utils.xianyu_utils import trans_cookies
 from utils.image_utils import image_manager
 from utils.order_status_rules import (
@@ -2797,10 +2798,16 @@ async def check_qr_code_status(session_id: str, current_user: Dict[str, Any] = D
 
         record = qr_check_processed.get(session_id)
         if record:
-            return record.get('result', {
+            result = record.get('result', {
                 'status': 'processing',
                 'message': '已确认，正在准备账号...'
             })
+            # 把重扫次数一并带给前端：登录不上时用户最想知道的就是
+            # 「我是不是已经扫太多次了」，而不是再去猜。
+            account_id = (result.get('account_info') or {}).get('account_id')
+            if account_id:
+                result.setdefault('qr_rescan_count', qr_rescan.recent_count(account_id))
+            return result
 
         session_lock = qr_check_locks[session_id]
         if session_lock.locked():
@@ -2880,11 +2887,38 @@ async def _process_qr_login_session(
             current_user
         )
         manager_operation = account_info.pop('_manager_operation', None)
+        rescan = qr_rescan.record_attempt(account_info['account_id'])
+        if rescan['notice']:
+            log_with_user(
+                'warning',
+                f"扫码登录频率提示: 账号={account_info['account_id']}, "
+                f"30分钟内第 {rescan['count']} 次扫码 - {rescan['notice']}",
+                current_user,
+            )
+            try:
+                db_manager.add_diagnostic_event(
+                    cookie_id=account_info['account_id'],
+                    event_type='qr_rescan_frequent',
+                    event_description='30分钟内多次扫码登录，有触发平台风控的风险',
+                    processing_result=(
+                        f"30分钟内扫码次数={rescan['count']}"
+                    ),
+                    processing_status='warning',
+                    error_message=rescan['notice'],
+                )
+            except Exception as diag_e:
+                log_with_user(
+                    'warning',
+                    f"写入扫码频率诊断事件失败: {diag_e}",
+                    current_user,
+                )
         result = {
             'status': 'success',
             'account_ready': True,
             'cookie_refresh_status': 'processing',
             'account_info': account_info,
+            'qr_rescan_count': rescan['count'],
+            'qr_rescan_notice': rescan['notice'],
             'message': '账号已保存，正在后台增强Cookie'
         }
         qr_check_processed[session_id] = {
@@ -3066,6 +3100,7 @@ async def _enhance_qr_login_cookies(
     refresh_error_type = None
     profile_success = False
     profile_error_type = None
+    temp_instance = None
     try:
         from XianyuAutoAsync import XianyuLive
 
@@ -3158,12 +3193,21 @@ async def _enhance_qr_login_cookies(
             '成功' if profile_success
             else f"失败({profile_error_type or 'unknown'})"
         )
+        # 滑块反复失败才是「登录不上」的真正原因：Cookie 已经落库了，但没补全，
+        # 运行态拿不到有效 token，下次刷新又会撞 RGV587。把失败原因写进风控
+        # 日志，界面上就能直接看到是滑块还是浏览器问题。
+        failure_reason = (
+            getattr(temp_instance, 'qr_enhance_failure_reason', None)
+            or refresh_error_type
+            or 'unknown'
+        )
         db_manager.add_diagnostic_event(
             cookie_id=account_id,
             event_type='qr_enhance_failed',
             event_description='扫码Cookie已保存，但后台补全真实Cookie失败',
             processing_result=(
                 f"cookie_refresh=失败({refresh_error_type or 'unknown'}), "
+                f"原因={failure_reason}, "
                 f"profile={profile_desc}, "
                 f"耗时={time.perf_counter() - started_at:.2f}s"
             ),

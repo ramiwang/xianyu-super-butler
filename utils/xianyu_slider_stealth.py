@@ -495,7 +495,7 @@ class XianyuSliderStealth:
                 self.playwright = sync_playwright().start()
                 self._stealth_engine = 'playwright'
                 logger.info(f"【{self.pure_user_id}】Playwright启动成功")
-            
+
             # 随机选择浏览器特征
             browser_features = self._get_random_browser_features()
             
@@ -630,7 +630,18 @@ class XianyuSliderStealth:
             logger.info(f"【{self.pure_user_id}】添加反检测脚本...")
             self.page.add_init_script(self._get_stealth_script(browser_features))
             logger.info(f"【{self.pure_user_id}】浏览器初始化完成")
-            
+
+            # 登记进程号：滑块一次要试 3 轮、每轮都可能超过一分钟。不登记的话，
+            # 残留清理线程会把正在用的浏览器当成没人管的孤儿进程杀掉，
+            # 反而把验证搞砸。
+            try:
+                browser_limit.bind_current_pids("滑块验证")
+            except Exception as bind_e:
+                logger.debug(
+                    f"【{self.pure_user_id}】登记滑块浏览器进程失败: "
+                    f"{type(bind_e).__name__}"
+                )
+
             return self.page
         except Exception as e:
             logger.error(f"【{self.pure_user_id}】初始化浏览器失败: {e}")
