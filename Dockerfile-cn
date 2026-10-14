@@ -100,18 +100,45 @@ ENV PLAYWRIGHT_DOWNLOAD_HOST=https://cdn.npmmirror.com/binaries/playwright
 # 或 --build-arg SKIP_CHROME=1 先跳过、把 Chrome 另行装入容器。
 ARG CHROME_DEB_URL=https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb
 ARG SKIP_CHROME=0
+
+# Chromium 与 Chrome 单独成层，不能和 COPY --from=builder /app /app 混在一起。
+# 混着时每改一行 Python 源码都会让这一层失效，于是每次改代码都要重新连
+# dl.google.com 下一份 300MB 的 .deb——网络一抖，构建就整个失败（wget 退出码 4）。
+# 拆开后，改源码只会重跑上面那层，这个下载绝大多数时候直接命中缓存。
 RUN playwright install-deps chromium && \
-    playwright install chromium && \
-    if [ "$SKIP_CHROME" != "1" ]; then \
-        apt-get update && \
-        apt-get install -y --no-install-recommends wget && \
-        wget -q -O /tmp/chrome.deb "$CHROME_DEB_URL" && \
-        apt-get install -y --no-install-recommends /tmp/chrome.deb && \
-        rm -f /tmp/chrome.deb; \
-    else \
+    playwright install chromium
+
+RUN if [ "$SKIP_CHROME" = "1" ]; then \
         echo "[build] SKIP_CHROME=1，跳过正式版 Chrome 安装"; \
-    fi && \
-    mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
+    else \
+        apt-get update && \
+        apt-get install -y --no-install-recommends wget ca-certificates && \
+        ok=0; \
+        for url in "$CHROME_DEB_URL" \
+                  https://dl.google.com/linux/direct/google-chrome-stable_current_amd64.deb; do \
+            echo "[build] 尝试下载 Chrome: $url"; \
+            # --tries/--timeout 是必需的：连不上时 wget 默认很快就退（退出码 4），
+            # 构建立刻失败，连重试的机会都没有。
+            if wget --tries=5 --waitretry=5 --timeout=30 --read-timeout=120 \
+                   -O /tmp/chrome.deb "$url" && [ -s /tmp/chrome.deb ]; then \
+                ok=1; \
+                break; \
+            fi; \
+            echo "[build] 下载失败，换下一个源"; \
+        done; \
+        if [ "$ok" != "1" ]; then \
+            echo "[build] 错误：Chrome 下载失败。滑块验证依赖正式版 Chrome，" ; \
+            echo "[build] 可换源: --build-arg CHROME_DEB_URL=<可达的 .deb 地址>"; \
+            exit 1; \
+        fi; \
+        apt-get install -y --no-install-recommends /tmp/chrome.deb || \
+            { echo "[build] 错误：Chrome .deb 安装失败"; exit 1; }; \
+        rm -f /tmp/chrome.deb; \
+        google-chrome --version || \
+            { echo "[build] 错误：Chrome 安装后仍不可用"; exit 1; }; \
+    fi
+
+RUN mkdir -p /app/logs /app/data /app/backups /app/static/uploads/images && \
     chmod 777 /app/logs /app/data /app/backups /app/static/uploads /app/static/uploads/images && \
     chmod +x /app/entrypoint.sh
 
