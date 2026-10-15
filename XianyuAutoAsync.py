@@ -2636,27 +2636,17 @@ class XianyuLive:
                 # 服务器无显示器时用 Xvfb 提供虚拟显示：
                 #   xvfb-run -a --server-args="-screen 0 1920x1080x24" python Start.py
                 slider_headless = os.getenv('SLIDER_HEADLESS', 'false').lower() == 'true'
-                slider_stealth = XianyuSliderStealth(
-                    user_id=f"{self.cookie_id}",
-                    enable_learning=True,  # 启用学习功能
-                    headless=slider_headless
-                )
-
-                # 在线程池中执行滑块验证
-                import asyncio
-                import concurrent.futures
-
-                loop = asyncio.get_event_loop()
-                with concurrent.futures.ThreadPoolExecutor() as executor:
-                    # 执行滑块验证。必须把账号 Cookie 一并传入 ——
-                    # 惩罚页的 x5secdata 绑定账号会话，不带 Cookie 时即使滑块拖过，
-                    # 回收到的也只是空浏览器凭证，风控不会解除。
-                    success, cookies = await loop.run_in_executor(
-                        executor,
-                        slider_stealth.run,
-                        verification_url,
-                        self.cookies_str
+                def run_captcha():
+                    # 构造函数会等待槽位，必须与浏览器操作一起放在工作线程。
+                    instance = XianyuSliderStealth(
+                        user_id=self.cookie_id, enable_learning=True, headless=slider_headless
                     )
+                    try:
+                        return instance, instance.run(verification_url, self.cookies_str)
+                    finally:
+                        instance.close_browser()
+
+                slider_stealth, (success, cookies) = await asyncio.to_thread(run_captcha)
 
                 if success and cookies:
                     # 边界防御：只有 x5sec 才是通行凭证。x5secdata / x5sectag 是挑战
@@ -3082,15 +3072,20 @@ class XianyuLive:
             
             # 在单独的线程中运行同步的登录方法
             import asyncio
-            slider = XianyuSliderStealth(user_id=self.cookie_id, enable_learning=False, headless=not show_browser)
-            result = await asyncio.to_thread(
-                slider.login_with_password_playwright,
-                account=username,
-                password=password,
-                show_browser=show_browser,
-                notification_callback=notification_callback_wrapper
-            )
-            
+            def run_password_login():
+                slider = XianyuSliderStealth(
+                    user_id=self.cookie_id, enable_learning=False, headless=not show_browser
+                )
+                try:
+                    return slider.login_with_password_playwright(
+                        account=username, password=password, show_browser=show_browser,
+                        notification_callback=notification_callback_wrapper
+                    )
+                finally:
+                    slider.close_browser()
+
+            result = await asyncio.to_thread(run_password_login)
+
             if result:
                 logger.info(f"【{self.cookie_id}】密码登录成功，获取到Cookie")
                 logger.info(

@@ -220,7 +220,7 @@ class SliderConcurrencyManager:
         with self.instance_lock:
             return len(self.active_instances) < self.max_concurrent
     
-    def wait_for_slot(self, user_id: str, timeout: int = None) -> bool:
+    def wait_for_slot(self, user_id: str, timeout: int = None, instance=None) -> bool:
         """等待可用槽位"""
         if timeout is None:
             timeout = self.wait_timeout
@@ -229,7 +229,13 @@ class SliderConcurrencyManager:
         
         while time.time() - start_time < timeout:
             with self.instance_lock:
-                if len(self.active_instances) < self.max_concurrent:
+                if len(self.active_instances) < self.max_concurrent and user_id not in self.active_instances:
+                    if instance is not None:
+                        self.active_instances[user_id] = {
+                            "instance": instance, "start_time": time.time()
+                        }
+                        if user_id in self.waiting_queue:
+                            self.waiting_queue.remove(user_id)
                     return True
             
             # 检查是否在等待队列中
@@ -264,10 +270,12 @@ class SliderConcurrencyManager:
             if user_id in self.waiting_queue:
                 self.waiting_queue.remove(user_id)
     
-    def unregister_instance(self, user_id: str):
+    def unregister_instance(self, user_id: str, instance=None):
         """注销实例"""
         with self.instance_lock:
             if user_id in self.active_instances:
+                if instance is not None and self.active_instances[user_id]['instance'] is not instance:
+                    return
                 del self.active_instances[user_id]
                 # 提取纯用户ID用于日志显示
                 pure_user_id = self._extract_pure_user_id(user_id)
@@ -412,6 +420,8 @@ class XianyuSliderStealth:
         self.context = None
         self.playwright = None
         self._browser_slot_held = False  # 是否占用着全局浏览器槽位
+        self._instance_registered = False
+        self.temp_dir = None
         self._stealth_engine = 'patchright' if PATCHRIGHT_AVAILABLE else 'playwright'
         
         # 提取纯用户ID（移除时间戳部分）
@@ -420,22 +430,6 @@ class XianyuSliderStealth:
         # 检查日期限制
         if not self._check_date_validity():
             raise Exception(f"【{self.pure_user_id}】日期验证失败，功能已过期")
-        
-        # 为每个实例创建独立的临时目录
-        self.temp_dir = tempfile.mkdtemp(prefix=f"slider_{user_id}_")
-        logger.debug(f"【{self.pure_user_id}】创建临时目录: {self.temp_dir}")
-        
-        # 等待可用槽位（排队机制）
-        logger.info(f"【{self.pure_user_id}】检查并发限制...")
-        if not concurrency_manager.wait_for_slot(self.user_id):
-            stats = concurrency_manager.get_stats()
-            logger.error(f"【{self.pure_user_id}】等待槽位超时，当前活跃: {stats['active_count']}/{stats['max_concurrent']}")
-            raise Exception(f"滑块验证等待槽位超时，请稍后重试")
-        
-        # 注册实例
-        concurrency_manager.register_instance(self.user_id, self)
-        stats = concurrency_manager.get_stats()
-        logger.info(f"【{self.pure_user_id}】实例已注册，当前并发: {stats['active_count']}/{stats['max_concurrent']}")
         
         # 轨迹学习相关属性
         
@@ -466,6 +460,20 @@ class XianyuSliderStealth:
         # 排查时完全看不出是浏览器没起来、页面没滑块，还是 x5sec 没拿到。
         self.last_failure_reason = ''
     
+        # 等待与注册必须原子完成，工作线程同时创建实例时不能超额占槽。
+        logger.info(f"【{self.pure_user_id}】检查并发限制...")
+        if not concurrency_manager.wait_for_slot(self.user_id, instance=self):
+            stats = concurrency_manager.get_stats()
+            logger.error(f"【{self.pure_user_id}】等待槽位超时，当前活跃: {stats['active_count']}/{stats['max_concurrent']}")
+            raise Exception("滑块验证等待槽位超时，请稍后重试")
+        self._instance_registered = True
+        try:
+            self.temp_dir = tempfile.mkdtemp(prefix=f"slider_{user_id}_")
+        except BaseException:
+            self.close_browser()
+            raise
+        logger.info(f"【{self.pure_user_id}】实例已注册，当前并发: {concurrency_manager.get_stats()['active_count']}")
+
     def _check_date_validity(self) -> bool:
         """检查日期有效性 - 已禁用
         
@@ -684,7 +692,7 @@ class XianyuSliderStealth:
         # 归还槽位。init_browser 是先占槽再启动浏览器，启动失败时若只清理进程
         # 不还槽位，就要等调用方记得调 close_browser 才归还 —— 只要有一条路径
         # 忘了，这个全局唯一的槽位就永久漏掉。
-        if self._browser_slot_held:
+        if getattr(self, "_browser_slot_held", False):
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
     
@@ -2435,13 +2443,14 @@ class XianyuSliderStealth:
             logger.warning(f"【{self.pure_user_id}】清理临时目录时出错: {e}")
 
         # 归还浏览器槽位。放在最后，确保浏览器进程确实退出后才放行下一个任务。
-        if self._browser_slot_held:
+        if getattr(self, "_browser_slot_held", False):
             self._browser_slot_held = False
             browser_limit.release_slot("滑块验证")
         
         # 注销实例（最后执行，确保其他清理完成）
         try:
-            concurrency_manager.unregister_instance(self.user_id)
+            concurrency_manager.unregister_instance(self.user_id, instance=self)
+            self._instance_registered = False
             stats = concurrency_manager.get_stats()
             logger.info(f"【{self.pure_user_id}】实例已注销，当前并发: {stats['active_count']}/{stats['max_concurrent']}，等待队列: {stats['queue_length']}")
         except Exception as e:
@@ -2453,7 +2462,7 @@ class XianyuSliderStealth:
         """析构函数，确保资源释放（保险机制）"""
         try:
             # 检查是否有未关闭的浏览器
-            if hasattr(self, 'browser') and self.browser:
+            if getattr(self, '_instance_registered', False) or getattr(self, 'browser', None):
                 logger.warning(f"【{self.pure_user_id}】析构函数检测到未关闭的浏览器，执行清理")
                 self.close_browser()
         except Exception as e:
@@ -3908,6 +3917,8 @@ class XianyuSliderStealth:
             if password_login_slot_held:
                 password_login_slot_held = False
                 browser_limit.release_slot("密码登录")
+            # 密码登录也会在构造时注册滑块实例，成功、失败和启动异常都要注销。
+            self.close_browser()
     
     def login_with_password_headful(self, account: str = None, password: str = None, show_browser: bool = False):
         """通过浏览器进行密码登录并获取Cookie (使用DrissionPage)

@@ -585,13 +585,15 @@ class XianyuSearcher:
                     
                     # 调用滑块处理方法
                     logger.info(f"🎯 开始处理滑块验证（最多尝试 {actual_max_retries} 次）...")
-                    slider_success = slider_handler.solve_slider(max_retries=actual_max_retries)
-                    
-                    # 清除引用，防止 XianyuSliderStealth 尝试关闭我们的浏览器
-                    slider_handler.page = None
-                    slider_handler.context = None
-                    slider_handler.browser = None
-                    slider_handler.playwright = None
+                    try:
+                        slider_success = slider_handler.solve_slider(max_retries=actual_max_retries)
+                    finally:
+                        # 浏览器由搜索任务持有，先解除引用，再归还滑块实例槽位。
+                        slider_handler.page = None
+                        slider_handler.context = None
+                        slider_handler.browser = None
+                        slider_handler.playwright = None
+                        slider_handler.close_browser()
                 
                 if slider_success:
                     logger.success("✅ 滑块验证成功！")

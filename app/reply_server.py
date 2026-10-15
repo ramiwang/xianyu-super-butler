@@ -2162,16 +2162,6 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         # 导入 XianyuSliderStealth
         from utils.xianyu_slider_stealth import XianyuSliderStealth
         
-        # 创建 XianyuSliderStealth 实例
-        slider_instance = XianyuSliderStealth(
-            user_id=account_id,
-            enable_learning=True,
-            headless=not show_browser
-        )
-        
-        # 更新会话信息
-        password_login_sessions[session_id]['slider_instance'] = slider_instance
-        
         # 定义通知回调函数，用于检测到人脸认证时返回验证链接或截图（同步函数）
         def notification_callback(message: str, screenshot_path: str = None, verification_url: str = None, screenshot_path_new: str = None):
             """人脸认证通知回调（同步）
@@ -2319,7 +2309,13 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
         import threading
         
         def run_login():
+            slider_instance = None
             try:
+                # 构造时会同步等待槽位，放到登录线程，避免阻塞事件循环。
+                slider_instance = XianyuSliderStealth(
+                    user_id=account_id, enable_learning=True, headless=not show_browser
+                )
+                password_login_sessions[session_id]['slider_instance'] = slider_instance
                 cookies_dict = slider_instance.login_with_password_playwright(
                     account=account,
                     password=password,
@@ -2466,8 +2462,8 @@ async def _execute_password_login(session_id: str, account_id: str, account: str
             finally:
                 # 清理实例（释放并发槽位）
                 try:
-                    from utils.xianyu_slider_stealth import concurrency_manager
-                    concurrency_manager.unregister_instance(account_id)
+                    if slider_instance is not None:
+                        slider_instance.close_browser()
                     log_with_user('debug', f"已释放并发槽位: {account_id}", current_user)
                 except Exception as cleanup_e:
                     log_with_user('warning', f"清理实例时出错: {str(cleanup_e)}", current_user)
